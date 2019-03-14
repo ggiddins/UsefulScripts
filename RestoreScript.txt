@@ -1,0 +1,185 @@
+--
+--
+--  This script generates the statements needed to restore the database using
+--  the most current full and differential backups.
+--
+--	
+
+DECLARE @Database NVARCHAR(100)
+DECLARE @MovePath NVARCHAR(400)
+
+--If you don't move datafile,Set @MovePath = '',  you'd only do this to restore it to a different location (QA server, for instance)
+
+
+
+--*****************************************************************
+--  Change this to the appropriate database you need to restore!
+--*****************************************************************
+SET @Database = 'test'
+
+
+
+
+--SET @MovePath = 'D:\database\'
+
+SET @MovePath = ''
+
+DECLARE @FullMediaSetID NVARCHAR(20)
+DECLARE @BackupSetID NVARCHAR(20)
+DECLARE @FullPath NVARCHAR(400)
+DECLARE @FullPosition NVARCHAR(20)
+
+DECLARE @LogMediaSetID NVARCHAR(20)
+DECLARE @LogPath NVARCHAR(400)
+DECLARE @LogPosition NVARCHAR(20)
+
+DECLARE @DiffMediaSetID NVARCHAR(20)
+DECLARE @DiffPath NVARCHAR(400)
+DECLARE @DiffPosition NVARCHAR(20)
+
+DECLARE @SQLMove NVARCHAR(MAX)
+SET @SQLMove =''
+
+IF @MovePath <> ''
+BEGIN
+	DECLARE @LogicalName NVARCHAR(200)
+	DECLARE @FileID NVARCHAR(10)
+	DECLARE @FileType NVARCHAR(10)
+	DECLARE @ExtName NVARCHAR(20)
+
+	DECLARE MoveCur CURSOR FOR 
+	SELECT m.name
+		,m.file_id
+		,m.type 
+	FROM sys.master_files m 
+		INNER JOIN sys.databases d 
+			ON m.database_id = d.database_id
+	WHERE d.name = @Database
+
+	OPEN MoveCur
+
+	FETCH NEXT FROM MoveCur INTO @LogicalName,@FileID,@FileType
+
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+		SET @ExtName = CASE  
+							WHEN @FileID = 1 THEN '.mdf'
+							WHEN @FileID > 1 THEN CASE @FileType 
+													WHEN 0 THEN '.ndf' ELSE '.ldf' END
+					   END
+		SET	@SQLMove = @SQLMove + CHAR(10) + '   , MOVE ' + '''' + @LogicalName + '''' 
+					   + ' TO ' + '''' + @MovePath + @LogicalName + @ExtName + ''''
+		FETCH NEXT FROM MoveCur INTO @LogicalName,@FileID,@FileType		
+	END
+	CLOSE MoveCur
+	DEALLOCATE MoveCur
+END
+
+
+SELECT 
+	@BackupSetID = backup_set_id,
+	@FullMediaSetID = media_set_id, 
+	@FullPosition = position
+FROM msdb.dbo.backupset 
+WHERE backup_set_id =
+(
+	SELECT MAX(backup_set_id) 
+	FROM msdb.dbo.backupset 
+	WHERE database_name = @Database 
+		AND type='D'
+	GROUP BY database_name
+)
+
+SELECT @FullPath = physical_device_name  
+FROM msdb.dbo.backupmediafamily 
+WHERE media_set_id = @FullMediaSetID
+
+IF NOT EXISTS(SELECT 1 FROM msdb.dbo.backupset 
+	WHERE database_name = @Database AND type IN('L','I') AND backup_set_id > @BackupSetID)
+BEGIN
+	PRINT REPLICATE('-',200)
+	PRINT '-----------//Full backup restore only'
+	PRINT REPLICATE('-',200)
+	PRINT 'RESTORE DATABASE ' + @Database + ' FROM DISK = ''' + @FullPath + '''' + CHAR(10) 
+		+ '   WITH FILE = ' + @FullPosition + ', REPLACE' + @SQLMove
+END
+
+
+IF EXISTS(SELECT 1 FROM msdb.dbo.backupset 
+	WHERE database_name = @Database AND type='L' AND backup_set_id > @BackupSetID)
+BEGIN
+	PRINT REPLICATE('-',200)
+	PRINT '-----------//Full backup and log backup restore '
+	PRINT REPLICATE('-',200)
+	PRINT 'RESTORE DATABASE ' + @Database + ' FROM DISK = ''' + @FullPath + '''' + CHAR(10)
+		+ '   WITH FILE = ' + @FullPosition + ', NORECOVERY, REPLACE ' + @SQLMove
+	
+	DECLARE log_cursor CURSOR FOR 
+	SELECT media_set_id
+		,position 
+	FROM msdb.dbo.backupset 
+	WHERE database_name = @Database 
+		AND type='L' 
+		AND backup_set_id > @BackupSetID 
+	ORDER BY backup_set_id
+
+	OPEN log_cursor
+
+	FETCH NEXT FROM log_cursor INTO @LogMediaSetID,@LogPosition
+
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+		SELECT @LogPath = physical_device_name  
+		FROM msdb.dbo.backupmediafamily 
+		WHERE media_set_id = @LogMediaSetID
+
+		PRINT 'RESTORE Log ' + @Database + ' FROM DISK = ''' + @LogPath
+			+ ''' WITH FILE = ' + @LogPosition + ', NORECOVERY'
+		FETCH NEXT FROM log_cursor INTO @LogMediaSetID,@LogPosition
+	END
+	CLOSE log_cursor
+	DEALLOCATE log_cursor
+
+	PRINT 'RESTORE DATABASE ' + @Database + ' WITH RECOVERY '
+END
+
+
+IF EXISTS(SELECT 1 FROM msdb.dbo.backupset 
+	WHERE database_name = @Database AND type='I' AND backup_set_id > @BackupSetID)
+BEGIN
+	PRINT REPLICATE('-',200)
+	PRINT '-----------//Full backup and differential backup restore '
+	PRINT REPLICATE('-',200)
+	PRINT 'RESTORE DATABASE ' + @Database + ' FROM DISK = ''' + @FullPath + '''' + CHAR(10)
+		+ '   WITH FILE = ' + @FullPosition + ', NORECOVERY, REPLACE ' + @SQLMove
+
+	DECLARE diff_cursor CURSOR FOR 
+	SELECT media_set_id
+		,position 
+	FROM msdb.dbo.backupset 
+	WHERE database_name = @Database 
+		AND type='I' 
+		AND backup_set_id > @BackupSetID 
+	ORDER BY backup_set_id
+
+	OPEN diff_cursor
+
+	FETCH NEXT FROM diff_cursor INTO @DiffMediaSetID,@DiffPosition
+
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+		SELECT @DiffPath = physical_device_name  
+		FROM msdb.dbo.backupmediafamily 
+		WHERE media_set_id = @DiffMediaSetID
+
+		PRINT 'RESTORE DATABASE ' + @Database + ' FROM DISK = ''' + @DiffPath 
+			+ ''' WITH FILE = ' + @DiffPosition + ', NORECOVERY'
+
+		FETCH NEXT FROM diff_cursor INTO @DiffMediaSetID,@DiffPosition
+	END
+	CLOSE diff_cursor
+	DEALLOCATE diff_cursor
+
+	PRINT 'RESTORE DATABASE ' + @Database + ' WITH RECOVERY '
+END
+GO
